@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+# One-shot: reads the latest audio chunk from /tmp/xhisper.wav and prints peak (0.0–1.0).
+# Called repeatedly by a QML timer via StdioCollector.
+import struct, os, sys
+
+WAV_FILE = "/tmp/xhisper.wav"
+CHUNK_BYTES = 1600  # ~0.05 s at 16000 Hz mono s16le
+
+try:
+    size = os.path.getsize(WAV_FILE)
+    if size > 44:
+        with open(WAV_FILE, "rb") as f:
+            f.seek(max(44, size - CHUNK_BYTES))
+            data = f.read(CHUNK_BYTES)
+        if data and len(data) >= 2:
+            aligned = data[: len(data) & ~1]
+            samples = struct.unpack("<" + str(len(aligned) // 2) + "h", aligned)
+            print(max(abs(s) for s in samples) / 32768.0)
+            sys.exit(0)
+except Exception:
+    pass
+
+print(0.0)
