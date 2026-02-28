@@ -180,6 +180,19 @@ paste() {
   press_wrap_key
 }
 
+# Wrapper: enters a Hyprland submap so ESC can cancel mid-paste.
+# ESC keybind kills xhispertool (unblocking the paste loop) then sends SIGTERM here.
+# The SIGTERM trap then cleans up and exits.
+paste_typing() {
+  echo $$ > /tmp/xhisper-paste.pid
+  trap 'hyprctl dispatch submap reset 2>/dev/null; rm -f /tmp/xhisper-paste.pid; exit 0' TERM
+  hyprctl dispatch submap xhisper-paste 2>/dev/null || true
+  paste "$1"
+  trap - TERM
+  hyprctl dispatch submap reset 2>/dev/null || true
+  rm -f /tmp/xhisper-paste.pid
+}
+
 delete_n_chars() {
   local n="$1"
   for ((i=0; i<n; i++)); do
@@ -231,45 +244,48 @@ post_process() {
   [ -z "$text" ] && echo "$text" && return
   [ -z "$post_process_model" ] && echo "$text" && return
 
-  # Check if ollama is available
-  if ! command -v ollama &> /dev/null; then
-    echo "Error: ollama not found. Install ollama or disable post-processing." >&2
-    echo "$text"
-    return
-  fi
-
-  local prompt
-
-  # Auto-detect mode
+  # Auto-detect mode: only trigger command mode when text starts with a known command word
   if [ "$mode" = "auto" ]; then
-    # Check for command indicators
-    if echo "$text" | grep -qE "^(sudo |apt |git |npm |pip |systemctl |docker |cd |ls |mkdir |rm |cp |mv |grep |find |cat |tail |head |ssh |curl |wget |make |cargo |python |node |code |vim |nano |man |chmod |chown |ln |tar |zip |unzip |mount |umount |ps |kill |top |htop |df |du |free |uname |export |alias |source |exit |pseudo )|^(apt|git|npm|pip|sudo|systemctl|docker|cargo) " || \
-       echo "$text" | grep -qE " (install|update|upgrade|remove|purge|status|start|stop|restart|enable|disable|clone|pull|push|commit|add|log|diff|checkout|branch|merge|rebase|init)( |$)"; then
+    if echo "$text" | grep -qiE "^(sudo|apt|git|npm|pip|systemctl|docker|cd|ls|mkdir|rm|cp|mv|grep|find|cat|ssh|curl|wget|make|cargo|python|node|vim|chmod|tar|export|alias|pseudo)\b"; then
       mode="command"
     else
       mode="standard"
     fi
   fi
 
-  # Build prompt based on mode
+  # System prompt — kept short and strict to prevent hallucination
+  local system_prompt
   case "$mode" in
     command)
-      prompt="You are a Linux command expert. Fix this command transcription. Rules: 1) Correct command names (sudo, apt, git, npm, systemctl, docker, etc.) 2) Keep flags exactly as spoken 3) Keep file paths as spoken 4) Fix pipe syntax 5) Output ONLY the corrected command, no explanations. Input: $text"
+      system_prompt="Fix this voice-transcribed Linux command. Correct only command names (e.g. 'pseudo'->'sudo'). Output ONLY the corrected command. No explanations, no markdown."
       ;;
     email)
-      prompt="Fix the grammar, punctuation, and capitalization of this email body text. Rules: 1) Use proper paragraph breaks (double line breaks between paragraphs) 2) Keep the tone natural and conversational 3) Do NOT add subject, salutation, or sign-off - user is typing in the body field 4) Output ONLY the formatted body text. Input: $text"
+      system_prompt="Fix grammar, punctuation and capitalisation in this email body. Add paragraph breaks where natural. Output ONLY the corrected text. No explanations."
       ;;
     standard|*)
-      prompt="Fix the grammar, punctuation, and capitalization of this text. Important: use apostrophes for contractions like don't, can't, I'm, you're, it's, etc. Keep text natural and conversational. Output ONLY the corrected text. Text: $text"
+      system_prompt="Fix punctuation and capitalisation in this speech-to-text transcript. Add commas at natural pauses. Add periods/question marks at sentence ends. Capitalise sentence starts. Fix obvious misheard words. Do NOT change any other words. Output ONLY the corrected text, nothing else."
       ;;
   esac
 
-  # Run ollama with timeout
-  local result=$(echo "$prompt" | timeout "$post_process_timeout" ollama run "$post_process_model" 2>/dev/null | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  # Use Ollama REST API so system/user roles are properly separated.
+  # Piping everything into `ollama run` confuses the model and causes hallucinations.
+  local result
+  result=$(
+    jq -n \
+      --arg m "$post_process_model" \
+      --arg s "$system_prompt" \
+      --arg p "$text" \
+      '{"model":$m,"system":$s,"prompt":$p,"stream":false,"options":{"temperature":0.1}}' \
+    | timeout "$post_process_timeout" curl -s -X POST http://localhost:11434/api/generate \
+        -H "Content-Type: application/json" -d @- \
+    | jq -r '.response // empty' \
+    | tr -d '\r' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  )
 
   logging_end_and_write_to_logfile "Post-Process [$mode]" "$result" "$logging_start"
 
-  # If ollama failed or timed out, return original text
+  # If API failed or timed out, return original text
   if [ -z "$result" ]; then
     echo "$text"
   else
@@ -285,7 +301,7 @@ transcribe() {
   if [ "$LOCAL_MODE" -eq 1 ]; then
     TRANSCRIPT_SCRIPT="$SCRIPT_DIR/xhisper_transcribe.py"
   else
-    TRANSCRIPT_SCRIPT="xhisper_transcribe"
+    TRANSCRIPT_SCRIPT="/usr/local/bin/xhisper_transcribe"
   fi
 
   # Build command arguments
@@ -299,8 +315,12 @@ transcribe() {
     cmd_args="$cmd_args --prompt \"$transcription_prompt\""
   fi
 
-  # Run transcription
-  local transcription=$(python3 "$TRANSCRIPT_SCRIPT" "$recording" $cmd_args 2>/dev/null)
+  # Run transcription (use conda env for CUDA-enabled ctranslate2)
+  local PYTHON="${HOME}/.conda/envs/xhisper/bin/python3"
+  [ ! -x "$PYTHON" ] && PYTHON="python3"
+  local NVIDIA_SITE="${HOME}/.conda/envs/xhisper/lib/python3.12/site-packages/nvidia"
+  local CUDA_LIBS="${NVIDIA_SITE}/cublas/lib:${NVIDIA_SITE}/cudnn/lib"
+  local transcription=$(LD_LIBRARY_PATH="${CUDA_LIBS}:${LD_LIBRARY_PATH}" "$PYTHON" "$TRANSCRIPT_SCRIPT" "$recording" $cmd_args 2>/dev/null)
 
   logging_end_and_write_to_logfile "Transcription" "$transcription" "$logging_start"
 
@@ -309,43 +329,42 @@ transcribe() {
 
 # Main
 
+hide_overlay() {
+  caelestia shell xhisper set hidden 2>/dev/null || true
+  sleep 0.12  # let it fade before typing starts
+}
+
 # Find recording process, if so then kill
 if pgrep -f "$PROCESS_PATTERN" > /dev/null; then
   pkill -f "$PROCESS_PATTERN"; sleep 0.2 # Buffer for flush
-  delete_n_chars 14 # "(recording...)"
 
   # Check if recording is silent
   if is_silent "$RECORDING"; then
-    paste "(no sound detected)"
-    sleep 0.6
-    delete_n_chars 19 # "(no sound detected)"
+    hide_overlay
     rm -f "$RECORDING"
     exit 0
   fi
 
-  paste "(transcribing...)"
+  caelestia shell xhisper set transcribing 2>/dev/null || true
   TRANSCRIPTION=$(transcribe "$RECORDING")
-  delete_n_chars 17 # "(transcribing...)"
 
   # Post-process with LLM if configured
   if [ -n "$post_process_model" ] && [ -n "$TRANSCRIPTION" ]; then
-    paste "(formatting...)"
     FORMATTED=$(post_process "$TRANSCRIPTION")
-    delete_n_chars 15 # "(formatting...)"
-    # Only paste if we got a result
+    hide_overlay
     if [ -n "$FORMATTED" ]; then
-      paste "$FORMATTED"
+      paste_typing "$FORMATTED"
     else
-      paste "$TRANSCRIPTION"
+      paste_typing "$TRANSCRIPTION"
     fi
   else
-    paste "$TRANSCRIPTION"
+    hide_overlay
+    paste_typing "$TRANSCRIPTION"
   fi
 
   rm -f "$RECORDING"
 else
-  # No recording running, so start
-  sleep 0.2
-  paste "(recording...)"
+  # No recording running, so start.
+  caelestia shell xhisper set recording 2>/dev/null || true
   pw-record --channels=1 --rate=16000 "$RECORDING"
 fi
