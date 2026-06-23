@@ -26,12 +26,18 @@ export LD_LIBRARY_PATH=/usr/local/lib/ollama/cuda_v12/lib:$LD_LIBRARY_PATH
 
 # Parse command-line arguments
 LOCAL_MODE=0
+CLAUDE_MODE=0
 WRAP_KEY=""
 POST_PROCESS_MODE=""  # Empty = use config/default
 for arg in "$@"; do
   case "$arg" in
     --local)
       LOCAL_MODE=1
+      ;;
+    --claude)
+      # Instead of pasting at the cursor, hand the transcript to a detached
+      # headless `claude -p` run that auto-executes it (SUPER SHIFT, R).
+      CLAUDE_MODE=1
       ;;
     --log)
       if [ -f "/tmp/xhisper.log" ]; then
@@ -53,7 +59,7 @@ for arg in "$@"; do
       ;;
     *)
       echo "Error: Unknown option '$arg'" >&2
-      echo "Usage: xhisper [--local] [--log] [--mode=auto|standard|command|email] [--leftalt|--rightalt|--leftctrl|--rightctrl|--leftshift|--rightshift|--super]" >&2
+      echo "Usage: xhisper [--local] [--claude] [--log] [--mode=auto|standard|command|email] [--leftalt|--rightalt|--leftctrl|--rightctrl|--leftshift|--rightshift|--super]" >&2
       exit 1
       ;;
   esac
@@ -335,6 +341,18 @@ if pgrep -f "$PROCESS_PATTERN" > /dev/null; then
 
   caelestia shell xhisper set transcribing 2>/dev/null || true
   TRANSCRIPTION=$(transcribe "$RECORDING")
+
+  # Claude execution mode: skip the LLM cleanup (send the faithful transcript)
+  # and hand it to a detached headless `claude` run that auto-executes it.
+  if [ "$CLAUDE_MODE" -eq 1 ]; then
+    hide_overlay
+    if [ -n "$TRANSCRIPTION" ]; then
+      HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/xhisper-claude-run.sh"
+      setsid "$HELPER" "$TRANSCRIPTION" >/dev/null 2>&1 < /dev/null &
+    fi
+    rm -f "$RECORDING"
+    exit 0
+  fi
 
   # Post-process with LLM if configured
   if [ -n "$post_process_model" ] && [ -n "$TRANSCRIPTION" ]; then
