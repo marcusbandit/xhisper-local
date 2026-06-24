@@ -33,6 +33,7 @@
 #   XHISPER_CLAUDE_TERM       terminal for the viewer      (default: kitty)
 #   XHISPER_CLAUDE_VIEWER     1=auto-open a viewer window  (default: 1)
 #   XHISPER_CLAUDE_NTFY       ntfy URL to also push to     (optional)
+#   XHISPER_CLAUDE_AUTO_COMPACT_WINDOW  auto-compact the chat at ~N tokens (default 150000)
 
 PROMPT="$1"
 [ -z "$PROMPT" ] && exit 0
@@ -46,6 +47,13 @@ SESSION="${XHISPER_CLAUDE_TMUX:-claude-voice}"
 SESSION_ID="${XHISPER_CLAUDE_SESSION_ID:-799980bd-41fd-4431-9acd-c17233afdda6}"
 TERM_CMD="${XHISPER_CLAUDE_TERM:-kitty}"
 VIEWER="${XHISPER_CLAUDE_VIEWER:-1}"
+# Auto-compact ceiling for this one long-lived chat. CLAUDE_CODE_AUTO_COMPACT_WINDOW
+# is the token window Claude Code treats as "full"; at 150k (well under the model's
+# real window) the session auto-compacts as it nears 150k tokens, so it stays light
+# and never grows large enough to choke or force a restart. Passed straight to the
+# claude process below (so tmux's server environment can't swallow it), and scoped
+# to THIS flow only -- your normal interactive Claude Code is untouched.
+ACWIN="${XHISPER_CLAUDE_AUTO_COMPACT_WINDOW:-150000}"
 NOTIFY="$(command -v notify-send || echo /usr/bin/notify-send)"
 APP="xhisper to Claude"
 
@@ -79,16 +87,19 @@ fi
 
 STARTED=0
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  CMD="$(printf '%q ' "$CLAUDE_BIN" --dangerously-skip-permissions "${MODEL_ARGS[@]}" "${RESUME_ARGS[@]}")"
+  CMD="$(printf '%q ' env "CLAUDE_CODE_AUTO_COMPACT_WINDOW=$ACWIN" "$CLAUDE_BIN" --dangerously-skip-permissions "${MODEL_ARGS[@]}" "${RESUME_ARGS[@]}")"
   tmux new-session -d -s "$SESSION" -c "$WORKDIR" "$CMD"
   STARTED=1
-  # If resume/create died immediately (e.g. a stale session id), fall back to a
-  # fresh conversation so you never get a dead session.
+  # Always continue THIS chat as-is: if it failed to start, do NOT silently fork
+  # onto a brand-new conversation (that would throw away the persistent context).
+  # Surface the failure instead and leave the saved transcript untouched.
   sleep 2
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "=== resume args failed; starting a fresh conversation ===" >> "$LOG"
-    CMD="$(printf '%q ' "$CLAUDE_BIN" --dangerously-skip-permissions "${MODEL_ARGS[@]}")"
-    tmux new-session -d -s "$SESSION" -c "$WORKDIR" "$CMD"
+    echo "=== session '$SESSION' failed to start with [${RESUME_ARGS[*]}] -- NOT forking to a fresh chat ===" >> "$LOG"
+    notify critical dialog-error "Claude chat didn't start" \
+"Couldn't resume conversation $SESSION_ID. Left as-is (no fresh fork) so the context is kept.
+Check: tmux attach -t $SESSION   --   log: $LOG"
+    exit 1
   fi
 fi
 
