@@ -229,6 +229,37 @@ logging_end_and_write_to_logfile() {
   echo "Time: ${time}s" >> "$LOGFILE"
 }
 
+# Fail-safe for the LLM cleanup: returns 0 only if `candidate` looks like a
+# light edit of `original` (punctuation, caps, small word fixes). Safety-tuned
+# models sometimes ANSWER or REFUSE the transcript instead of cleaning it
+# (e.g. dictating about sudo produced "I can't assist with installing
+# software..." which got pasted at the cursor). No prompt can rule that out,
+# so we gate on shape: most of the original words must survive, and the word
+# count must not balloon or collapse.
+is_faithful_cleanup() {
+  local original="$1" candidate="$2"
+  awk -v orig="$original" -v cand="$candidate" '
+    function tokenize(s, set,   i, n, parts, count) {
+      s = tolower(s)
+      n = split(s, parts, /[^[:alnum:]]+/)
+      count = 0
+      for (i = 1; i <= n; i++) if (parts[i] != "") { set[parts[i]] = 1; count++ }
+      return count
+    }
+    BEGIN {
+      in_total = tokenize(orig, oset)
+      out_total = tokenize(cand, cset)
+      if (in_total == 0) exit 1
+      uniq = 0; hit = 0
+      for (w in oset) { uniq++; if (w in cset) hit++ }
+      if (hit / uniq < 0.6) exit 1            # too many original words gone
+      if (out_total > in_total * 1.2 + 3) exit 1  # model added content
+      if (out_total < in_total * 0.5) exit 1      # model dropped content
+      exit 0
+    }
+  '
+}
+
 post_process() {
   local text="$1"
   local mode="${2:-$post_process_mode}"
@@ -282,9 +313,19 @@ post_process() {
   # If API failed or timed out, return original text
   if [ -z "$result" ]; then
     echo "$text"
-  else
-    echo "$result"
+    return
   fi
+
+  # If the model chatted instead of cleaning (refusal, answer, hallucination),
+  # discard its output and paste the raw transcript. The user's words must
+  # never be replaced by model chatter.
+  if ! is_faithful_cleanup "$text" "$result"; then
+    echo "=== Post-Process REJECTED (model output is not a faithful cleanup; using raw transcript) ===" >> "$LOGFILE"
+    echo "$text"
+    return
+  fi
+
+  echo "$result"
 }
 
 transcribe() {
