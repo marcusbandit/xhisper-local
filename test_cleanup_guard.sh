@@ -71,6 +71,43 @@ This is something else on the second line. I'm just gonna list a few things. The
 That is all on the list."
 expect accept "formatter output accepted" "$FMT_IN" "$FMT_OUT"
 
+# Incident 2 (2026-07-09): the formatter INVENTED list items the speaker
+# never said ("- Windows - Python - JavaScript") and the guard passed it.
+# The output may contain at most 2 words absent from the input.
+INV_IN="XHesper, there's a lot of spelling mistakes here that it should simply just fix in the cleanup automatically. Like we want to keep a word count of all this and then clean up automatically. It should look for these types of things that are programs and system names and stuff like that and then fix them when I speak."
+INV_OUT="$INV_IN
+
+- Windows
+- Python
+- JavaScript"
+expect reject "invented list items rejected" "$INV_IN" "$INV_OUT"
+
+# Invention built from the speaker's OWN words (duplicated into fake list
+# items) must also be rejected: counted as a multiset, not unique words
+DUP_OUT="Hi, there's a lot of spelling mistakes here that it should simply just fix in the cleanup automatically. Like we want to keep a word count of all this and then clean up automatically. It should look for these types of things that are programs and system names and stuff like that and then fix them when I speak.
+
+- Programs
+- System names"
+expect reject "duplicated-word list items rejected" "$INV_IN" "$DUP_OUT"
+
+# Vocabulary spelling fixes introduce a couple of new words; still accepted
+expect accept "vocab spelling fix accepted" \
+  "I use Calistia with XHesper on Arch" \
+  "I use caelestia with xhisper on Arch."
+
+# Incident 3 (2026-07-09): Japanese dictation. No spaces means word-level
+# tokens are blind; hallucinated sentences must burn per-character budget.
+JA_IN="はじめまして、マークスです。"
+JA_OUT="はじめまして、マークスです。
+
+私は日本人ですが、現在はアメリカで生活しています。"
+expect reject "japanese hallucination rejected" "$JA_IN" "$JA_OUT"
+
+# Punctuation-only changes in Japanese stay accepted
+expect accept "japanese punctuation fix accepted" \
+  "はじめまして マークスです" \
+  "はじめまして、マークスです。"
+
 # strip_preamble: model-added header lines must go, dictated content must stay
 check_strip() {
   local name="$1" input="$2" want="$3"

@@ -56,7 +56,7 @@ def transcribe_file(
     # Clean up extra whitespace
     text = " ".join(text.split())
 
-    return text
+    return text, info.language
 
 
 def main():
@@ -85,6 +85,10 @@ def main():
         help="Context words for better accuracy",
     )
     parser.add_argument(
+        "--lang-file",
+        help="Write the detected language code (e.g. en, da, ja) to this file",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug output",
@@ -101,13 +105,15 @@ def main():
         sys.exit(1)
 
     try:
-        result = transcribe_file(
+        result, detected_language = transcribe_file(
             args.audio_file,
             model_size=args.model,
             device=args.device,
             language=args.language,
             prompt=args.prompt,
         )
+        if args.lang_file:
+            Path(args.lang_file).write_text(detected_language or "")
         print(result)
     except Exception as e:
         print(f"Error during transcription: {e}", file=sys.stderr)
