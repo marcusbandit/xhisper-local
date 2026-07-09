@@ -85,7 +85,7 @@ xhisper --rightalt       # Use right alt as input switch (non-QWERTY layouts)
 ## AI Formatting Modes
 
 - **auto**: Detects commands vs text automatically (checks for sudo, apt, git, etc.)
-- **standard**: Grammar, punctuation, capitalization
+- **standard**: Formatter: fixes punctuation/capitalisation, splits comma splices into sentences, auto-formats dictated lists as `- ` bullets. Spoken commands ("new line", "new paragraph", "bullet point") are converted to real formatting by a deterministic pass in xhisper.sh BEFORE the LLM (see `apply_voice_commands`). All LLM output is gated by `is_faithful_cleanup`; on rejection the raw transcript is pasted (see test_cleanup_guard.sh, test_voice_commands.sh)
 - **command**: Linux command syntax correction (e.g., "pseudo" → "sudo")
 - **email**: Email body formatting with paragraph breaks (no subject/salutation added)
 

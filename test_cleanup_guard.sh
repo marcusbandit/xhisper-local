@@ -8,13 +8,19 @@
 
 cd "$(dirname "$0")" || exit 1
 
-# Extract just the guard function from xhisper.sh
+# Extract the guard + preamble-strip functions from xhisper.sh
 GUARD_SRC=$(sed -n '/^is_faithful_cleanup()/,/^}$/p' xhisper.sh)
 if [ -z "$GUARD_SRC" ]; then
   echo "FAIL: is_faithful_cleanup() not found in xhisper.sh"
   exit 1
 fi
 eval "$GUARD_SRC"
+STRIP_SRC=$(sed -n '/^strip_preamble()/,/^}$/p' xhisper.sh)
+if [ -z "$STRIP_SRC" ]; then
+  echo "FAIL: strip_preamble() not found in xhisper.sh"
+  exit 1
+fi
+eval "$STRIP_SRC"
 
 PASS=0
 FAIL=0
@@ -52,6 +58,47 @@ expect reject "answer instead of cleanup rejected" "what time is it in Tokyo rig
 
 # Word-fix in command mode (pseudo -> sudo) stays accepted
 expect accept "command word fix accepted" "pseudo pacman -S ripgrep" "sudo pacman -S ripgrep"
+
+# Formatter-style restructuring (newlines, bullets, dropped command words)
+# must still count as faithful
+FMT_IN="and if I just say, new line, this is something else on the second line, and I'm just gonna list a few things, so the list is, important stuff, my phone, Pepsi Max, my backpack, that is all on the list"
+FMT_OUT="And if I just say:
+This is something else on the second line. I'm just gonna list a few things. The list is:
+- important stuff
+- my phone
+- Pepsi Max
+- my backpack
+That is all on the list."
+expect accept "formatter output accepted" "$FMT_IN" "$FMT_OUT"
+
+# strip_preamble: model-added header lines must go, dictated content must stay
+check_strip() {
+  local name="$1" input="$2" want="$3"
+  local got
+  got=$(strip_preamble "$input")
+  if [ "$got" = "$want" ]; then
+    echo "PASS: $name"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL: $name"
+    printf '  want: [%q]\n  got:  [%q]\n' "$want" "$got"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+check_strip "known preamble stripped" \
+  "Here is the formatted transcript:
+
+Alright, so this is a test." \
+  "Alright, so this is a test."
+
+check_strip "dictated colon line kept" \
+  "Here is my plan:
+- first thing
+- second thing" \
+  "Here is my plan:
+- first thing
+- second thing"
 
 echo
 echo "$PASS passed, $FAIL failed"
