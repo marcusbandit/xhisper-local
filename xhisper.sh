@@ -92,6 +92,7 @@ post_process_model=""
 post_process_timeout=10
 post_process_mode="auto"
 post_process_languages="en"
+multilingual="true"
 LANG_FILE="/tmp/xhisper.lang"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/xhisper/xhisperrc"
@@ -117,6 +118,7 @@ if [ -f "$CONFIG_FILE" ]; then
       non-ascii-default-delay) non_ascii_default_delay="$value" ;;
       post-process-model) post_process_model="$value" ;;
       post-process-languages) post_process_languages="$value" ;;
+      multilingual) multilingual="$value" ;;
       post-process-timeout) post_process_timeout="$value" ;;
       post-process-mode) post_process_mode="$value" ;;
     esac
@@ -430,6 +432,17 @@ post_process_language_ok() {
   esac
 }
 
+# Second, independent gate: the English formatter must never see non-ASCII
+# text. With per-segment multilingual transcription a mostly-English clip can
+# still carry a Japanese clause, and whisper reports the clip as "en" so the
+# language gate alone would let it through and the model would drop the
+# Japanese. Any byte outside printable ASCII means "not pure English, paste
+# it faithfully". Latin-accented languages (Danish/French) are already caught
+# by the language gate; this just backstops mixed content.
+transcript_is_ascii() {
+  ! printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'
+}
+
 # Run post_process once per line so pre-applied line breaks (from spoken
 # commands) survive the LLM by construction: small models sometimes merge or
 # eat newlines despite instructions. Blank lines pass through untouched.
@@ -478,6 +491,12 @@ transcribe() {
   rm -f "$LANG_FILE"
   if grep -q -- "--lang-file" "$TRANSCRIPT_SCRIPT" 2>/dev/null; then
     cmd_args+=("--lang-file" "$LANG_FILE")
+  fi
+  # Per-segment language detection so one recording can switch languages
+  # (Japanese then English) without dropping the non-dominant one. Guarded
+  # the same way, so an older installed transcriber never chokes on it.
+  if [ "$multilingual" = "true" ] && grep -q -- "--multilingual" "$TRANSCRIPT_SCRIPT" 2>/dev/null; then
+    cmd_args+=("--multilingual")
   fi
 
   # Run transcription (use conda env for CUDA-enabled ctranslate2)
@@ -532,7 +551,7 @@ if pgrep -f "$PROCESS_PATTERN" > /dev/null; then
   # catches stragglers the model normalised into command form.
   COMMANDED=$(apply_voice_commands "$TRANSCRIPTION")
 
-  if [ -n "$post_process_model" ] && [ -n "$COMMANDED" ] && post_process_language_ok; then
+  if [ -n "$post_process_model" ] && [ -n "$COMMANDED" ] && post_process_language_ok && transcript_is_ascii "$COMMANDED"; then
     caelestia shell xhisper set formatting 2>/dev/null || true
     FORMATTED=$(post_process_segments "$COMMANDED")
     hide_overlay
@@ -540,7 +559,11 @@ if pgrep -f "$PROCESS_PATTERN" > /dev/null; then
     paste_typing "$(apply_vocabulary_aliases "$(apply_voice_commands "${FORMATTED:-$COMMANDED}")")"
   else
     if [ -n "$post_process_model" ] && [ -n "$COMMANDED" ]; then
-      echo "=== Post-Process skipped (detected language '$(cat "$LANG_FILE" 2>/dev/null)' not in [$post_process_languages]) ===" >> "$LOGFILE"
+      if ! transcript_is_ascii "$COMMANDED"; then
+        echo "=== Post-Process skipped (transcript contains non-ASCII; pasting faithfully) ===" >> "$LOGFILE"
+      else
+        echo "=== Post-Process skipped (detected language '$(cat "$LANG_FILE" 2>/dev/null)' not in [$post_process_languages]) ===" >> "$LOGFILE"
+      fi
     fi
     hide_overlay
     paste_typing "$COMMANDED"

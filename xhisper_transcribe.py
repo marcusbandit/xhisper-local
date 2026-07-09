@@ -18,6 +18,7 @@ def transcribe_file(
     device: str = "auto",
     language: str = None,
     prompt: str = None,
+    multilingual: bool = False,
 ) -> str:
     """
     Transcribe an audio file using faster-whisper.
@@ -28,9 +29,13 @@ def transcribe_file(
         device: Device to use (auto, cpu, cuda)
         language: Language code (e.g., 'en', 'es') or None for auto-detect
         prompt: Optional context text for better accuracy
+        multilingual: Detect language per segment instead of once for the whole
+            clip. Lets a single recording that switches languages (e.g. Japanese
+            then English) transcribe every part instead of dropping the parts
+            that are not the dominant language.
 
     Returns:
-        Transcribed text
+        (text, detected_language)
     """
     from faster_whisper import WhisperModel
 
@@ -48,6 +53,7 @@ def transcribe_file(
         initial_prompt=prompt,
         beam_size=5,
         vad_filter=True,  # Voice activity detection to remove silence
+        multilingual=multilingual,
     )
 
     # Combine all segments
@@ -89,6 +95,11 @@ def main():
         help="Write the detected language code (e.g. en, da, ja) to this file",
     )
     parser.add_argument(
+        "--multilingual",
+        action="store_true",
+        help="Detect language per segment so one recording can mix languages",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug output",
@@ -111,6 +122,7 @@ def main():
             device=args.device,
             language=args.language,
             prompt=args.prompt,
+            multilingual=args.multilingual,
         )
         if args.lang_file:
             Path(args.lang_file).write_text(detected_language or "")
