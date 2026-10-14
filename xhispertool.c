@@ -11,9 +11,12 @@
 #include <errno.h>
 #include <stdint.h>
 #include <libgen.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/ioctl.h>
 #include <linux/uinput.h>
+#include <linux/input.h>
 #define KEY_LEFTCTRL 29
 #define KEY_RIGHTCTRL 97
 #define KEY_LEFTALT 56
@@ -21,19 +24,30 @@
 #define KEY_LEFTSHIFT 42
 #define KEY_RIGHTSHIFT 54
 #define KEY_LEFTMETA 125
+#ifndef KEY_RIGHTMETA
+#define KEY_RIGHTMETA 126
+#endif
 #define KEY_V 47
 #define FLAG_UPPERCASE 0x80000000
+
+// Inter-character delay for batched string typing (microseconds).
+// Tuned to give applications time between key events so spaces and rapid
+// characters aren't dropped due to autocomplete handlers or input races.
+#define INTER_CHAR_DELAY_US 6000
 
 // Function prototypes
 void cleanup(void);
 void emit(int type, int code, int val);
 void do_paste(void);
 void type_char(unsigned char c);
+void type_string(const char *s, size_t len);
 void do_backspace(void);
 void do_key(int keycode);
 int setup_uinput(void);
 int setup_socket(void);
 int run_daemon(void);
+int is_meta_held(void);
+void wait_meta_release(int timeout_ms);
 void show_usage(void);
 int run_client(int argc, char *argv[]);
 
@@ -180,6 +194,58 @@ void type_char(unsigned char c) {
     }
 }
 
+void type_string(const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        type_char((unsigned char)s[i]);
+        if (i + 1 < len) usleep(INTER_CHAR_DELAY_US);
+    }
+}
+
+// Check if either Super (Meta) key is currently held down on any keyboard
+// device under /dev/input. Returns 1 if held, 0 if released, -1 on error.
+int is_meta_held(void) {
+    DIR *dir = opendir("/dev/input");
+    if (!dir) return -1;
+
+    int held = 0;
+    struct dirent *entry;
+    unsigned char keys[(KEY_MAX + 7) / 8];
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "event", 5) != 0) continue;
+
+        char path[288];
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        memset(keys, 0, sizeof(keys));
+        if (ioctl(fd, EVIOCGKEY(sizeof(keys)), keys) >= 0) {
+            if ((keys[KEY_LEFTMETA / 8]  & (1 << (KEY_LEFTMETA  % 8))) ||
+                (keys[KEY_RIGHTMETA / 8] & (1 << (KEY_RIGHTMETA % 8)))) {
+                held = 1;
+            }
+        }
+        close(fd);
+        if (held) break;
+    }
+    closedir(dir);
+    return held;
+}
+
+// Block until no Super key is held, or until timeout_ms elapses.
+// Polls every 10ms.
+void wait_meta_release(int timeout_ms) {
+    int waited = 0;
+    while (waited < timeout_ms) {
+        int h = is_meta_held();
+        if (h <= 0) return;  // released or error (don't loop forever)
+        usleep(10000);
+        waited += 10;
+    }
+}
+
 void do_backspace() {
     emit(EV_KEY, KEY_BACKSPACE, 1);
     emit(EV_SYN, SYN_REPORT, 0);
@@ -297,7 +363,7 @@ int run_daemon() {
 
     printf("xhispertoold: listening on @xhisper_socket\n");
 
-    char buf[2];
+    char buf[8192];
     while (1) {
         ssize_t n = recv(fd_socket, buf, sizeof(buf), 0);
         if (n >= 1) {
@@ -306,6 +372,12 @@ int run_daemon() {
                 do_paste();
             } else if (cmd == 't' && n == 2) {
                 type_char((unsigned char)buf[1]);
+            } else if (cmd == 'T' && n >= 2) {
+                // Batched string type: rest of message is bytes to type
+                type_string(buf + 1, (size_t)(n - 1));
+            } else if (cmd == 'W') {
+                // Wait for Super key release (default 2s timeout)
+                wait_meta_release(2000);
             } else if (cmd == 'b') {
                 do_backspace();
             } else if (cmd == 'r') {
@@ -335,6 +407,8 @@ void show_usage() {
         "Usage:\n"
         "  xhispertool paste            - Paste from clipboard (Ctrl+V)\n"
         "  xhispertool type <char>      - Type a single ASCII character\n"
+        "  xhispertool type-string <s>  - Type a string of ASCII characters\n"
+        "  xhispertool wait-meta-release - Block until Super key is released\n"
         "  xhispertool backspace        - Press backspace\n"
         "\n"
         "Input switching keys:\n"
@@ -355,6 +429,19 @@ int run_client(int argc, char *argv[]) {
     if (argc < 2) {
         show_usage();
         return 1;
+    }
+
+    // wait-meta-release runs entirely in the client (no daemon needed):
+    // it just polls /dev/input/event* via EVIOCGKEY. Doing this client-side
+    // avoids blocking the daemon while we wait.
+    if (strcmp(argv[1], "wait-meta-release") == 0) {
+        int timeout_ms = 2000;
+        if (argc >= 3) {
+            timeout_ms = atoi(argv[2]);
+            if (timeout_ms <= 0) timeout_ms = 2000;
+        }
+        wait_meta_release(timeout_ms);
+        return 0;
     }
 
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -387,7 +474,7 @@ int run_client(int argc, char *argv[]) {
         return 2;
     }
 
-    char buf[2];
+    char buf[8192];
     ssize_t len = 0;
 
     if (strcmp(argv[1], "paste") == 0) {
@@ -427,6 +514,18 @@ int run_client(int argc, char *argv[]) {
         buf[0] = 't';
         buf[1] = argv[2][0];
         len = 2;
+    } else if (strcmp(argv[1], "type-string") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "Error: 'type-string' requires exactly one string argument\n");
+            show_usage();
+            close(fd);
+            return 1;
+        }
+        size_t slen = strlen(argv[2]);
+        if (slen > sizeof(buf) - 1) slen = sizeof(buf) - 1;
+        buf[0] = 'T';
+        memcpy(buf + 1, argv[2], slen);
+        len = (ssize_t)(slen + 1);
     } else {
         fprintf(stderr, "Error: Unknown command '%s'\n", argv[1]);
         show_usage();
